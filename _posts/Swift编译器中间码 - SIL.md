@@ -1,0 +1,383 @@
+---
+title: Swift编译器中间码 - SIL
+author: Roy
+date: 2020-06-27 00:34:00 +0800
+categories: [其他]
+tags: [Swift]
+pin: true
+---
+
+### 为什么要设计SIL
+
+![](/assets/img/2020/SIL/clang.png)
+
+上图是传统的基于LLVM的编译器流程，比如C、C++以及Objective-C。代码分析主要是基于CFG（AST级别），CFG全称Control Flow Graph（函数流程控制图），是在clang这一层，但是这有很多缺点。
+
+**缺点：**  
+
+* 源码和LLVM IR之间的巨大抽象差距不适用于源码级分析
+* CFG缺乏保真度
+* CFG不是在hot path上，hot path是指被多次迭代的代码块，图上可以看到不是在编译器流程的主路径上
+* CFG和IR降低中有很多的重复工作
+
+Swift作为一种高级语言，有些高级特性，比如基于protocol的泛型。而且也是一门安全的语言，确保变量在使用之前被初始化、检测不可执行的代码（unreachable code）。于是为Swift编译器增加了一层SIL来做这些事情。
+
+**SIL**
+
+* 能够完全保留程序的语义
+* 专为代码生成和分析而设计
+* 在编译器流程的hot path上
+* 弥补源码和LLVM之间的巨大抽象
+
+### SIL简介
+
+
+![](/assets/img/2020/SIL/swiftc_pipeline.png)
+
+Swift编译器在AST和LLVM IR之间有一个中间表示形式，称为SIL。通过使用访问者（Visitor）模式扫描AST来生成SIL。SIL会对Swift进行高级别的语意分析和优化。像LLVM IR一样，也具有诸如Module，Function和BasicBlock之类的结构。与LLVM IR不同，它具有更丰富的类型系统，有关循环和错误处理的信息仍然保留，并且虚函数表和类型信息以结构化形式保留。它旨在保留Swift的含义，以实现强大的错误检测，内存管理和高级优化。
+
+同时像LLVM IR一样，SIL是静态单赋值[Static-Single-Assignment (SSA)](https://en.wikipedia.org/wiki/Static_single_assignment_form)，因此永远都不能重新定义值。当一条指令引用一个值时，该值要么是当前基本块的输入参数，要么由该块中的单个唯一指令定义。注意，与“真正的”编程语言不同，SIL是“扁平的”，因为在语法上没有嵌套的结构。每条指令引用其他指令产生的值，并对它们执行一个逻辑运算以产生新值。
+
+相关代码：  
+[/lib/SILGen](https://github.com/apple/swift/tree/master/lib/SILGen)  
+[/lib/SIL](https://github.com/apple/swift/tree/master/lib/SIL)
+
+
+### SSA
+
+SSA 代表 static single-assignment，是一种IR(中间表示代码)，要保证每个变量只被赋值一次。这个能帮助简化编译器的优化算法。
+
+```
+x = 0;
+x = 1;
+y = 2 * x;
+
+```
+
+比如上面这段代码，y = 1其实是不可用的，这个要通过定义的可达分析来确定y是要用1还是2，而SSA有一个标识符可以称之为版本或者"代"。
+
+
+```
+x1 = 0;
+x2 = 1;
+y = 2 * x2;
+```
+
+这样就没有任何间接值了。用SSA表示的好处是对于同一个变量的无关使用表示成不同"代"，可以方便很多编译器的优化算法的实现。
+
+
+**概括起来，SSA带来四大益处：**
+
+* 因为SSA使得每个变量都有唯一的定义，因此数据流分析和优化算法可以更加简单。
+* 使用-定义关系链所消耗空间从指数增长降低为线性增长。若一个变量有N个使用和M个定义，若不采用SSA，则存在M×N个使用-定义关系。
+* SSA中因为使用和定义的关系更加的精确，能简化构建干扰图的算法。
+* 源程序中对同一个变量的不相关的若干次使用，在SSA形式中会转变成对不同变量的使用，因此能消除很多不必要的依赖关系。
+
+有了精确的对象使用–定义关系，许多利用使用–定义关系的优化就能更精确、更彻底、更高效。如
+
+* 常数传播
+* 死代码删除
+* 全局
+* 部分冗余删除
+* 强度削弱
+* 寄存器分配
+
+
+关于SSA这里就不多讲了，还没深入研究过，之后可能会单独写篇文章讲一讲，另外推荐一本书**Static Single Assignment Book**。
+
+### SIL语言特点
+
+* 单行指令，即一行表示一条指令
+* 强类型
+* 方法分解成连续的building-blocks（也就是BB）
+* 包含ARC指令
+* 专为代码分发而设计
+* SIL寄存器数目是无限的，从%0，%1，%2这样递增
+
+### SIL结构
+
+SIL程序是命名函数的集合，每个函数由一个或多个基本块组成。基本块是线性的指令序列，每个块中的最后一条指令将控制权转移到另一个基本块，或从函数返回。
+
+#### Module
+
+整个SIL源文件，中文叫模块，由SILFunction和SILGlobalVariable组成。可以通过begin() 和 end() 获得迭代器，通过迭代器可以快速遍历该模块中所有的函数。
+
+```
+using iterator = FunctionListType::iterator;
+iterator begin() { return functions.begin(); }
+iterator end() { return functions.end(); }
+```
+
+完整接口可通过下面地址查看：
+
+[include/swift/SIL/SILModule.h](https://github.com/apple/swift/blob/master/include/swift/SIL/SILModule.h)
+
+#### Function
+
+包含函数定义和声明有关的所有对象。每个SILFunction由SILBasicBlock和SILArgument组成，可以看成是Swift函数的直接转换。通过isDefinition()可检查它是否是在本模块中声明的。这两种情况下都包含参数列表，可通过getArgument()来获得参数列表。
+
+```
+SILArgument *getArgument(unsigned i) 
+  
+ArrayRef<SILArgument *> getArguments() const
+```
+完整接口可通过下面地址查看：
+[include/swift/SIL/SILFunction.h](https://github.com/apple/swift/blob/master/include/swift/SIL/SILFunction.h)
+
+#### Basic Block
+SILBasicBlock由SILInstruction组成，是线性的指令序列，每个SILBasicBlock中的最后一条指令将控制权转移到另一个SILBasicBlock，或从函数返回。可通过begin() / end()访问SILInstruction。也可以使用getTerminator()方法直接访问最后一条指令。
+
+```
+TermInst *getTerminator()
+```
+
+完整接口可通过下面地址查看：
+[include/swift/SIL/SILBasicBlock.h](https://github.com/apple/swift/blob/master/include/swift/SIL/SILBasicBlock.h)
+
+
+
+#### Instruction
+
+SIL中的基本单元，实际操作值或调用函数的指令。
+
+![](/assets/img/2020/SIL/SIL_Structure.png)
+
+
+### SILValue和SILType
+
+
+#### SILValue
+
+SILValue定义了use\_begin() 和 use\_end()方法用于遍历User，或者通过getUses() 来获得所有User的范围，这对于迭代所有User很有用，如果要忽略调试信息指令，可以改用getNonDebugUses，通过这些方法可以简单访问它的def-use链。
+
+```
+  inline use_range getUses() const;
+```
+
+#### SILType
+每个SIL值都有一个SIL类型，可以在这里查看源码[SILType.h](https://github.com/apple/swift/blob/master/include/swift/SIL/SILType.h)。有SIL类型可以分为两大种，object（对象） 和 addresses（地址）类型。这里的对象和传统的面向对象编程的对象不同，对象类型包括整型，一个类的实例对象，结构值或函数。地址是存储指向对象类型的指针的值。可以通过isAddress() 和 isObject() 来判断类型。
+
+```
+/// True if the type is an address type.
+bool isAddress() const { return getCategory() == SILValueCategory::Address; }
+
+/// True if the type is an object type.
+bool isObject() const { return getCategory() == SILValueCategory::Object; }
+```
+
+**Metatype Types**   
+SILType有很多种，元数据类型是其中一种，SIL中一个具体的元数据类型必须描述其表现形式
+
+* @thin，代表一个确切的具体类型，不需要存储。
+* @thick，描述元类型代表的形式，是引用一个对象类型或是其子类
+* @objc，代表使用Objective-C类对象表示，而不是纯Swift类型对象表示
+
+
+**type lowering**  
+type lowering类型降级，我们平常在写swift中用到的系统提供的类型称为formal type，也就是正式类型。Swift的形式类型系统有意抽象了许多代表性的问题，例如所有权转移约定和参数的直接性。而SIL旨在代表大多数此类实现细节，这些差异应在SIL类型系统中得到体现，因此SIL type要丰富的多。从formal type到SIL type的转换的操作称为类型降级，SIL type又称为“lowered types”，降低的类型。
+
+由于SIL是一种中间语言，SIL值大致对应于抽象机的无限寄存器。address-only（纯地址）类型本质上是那些“太复杂”而无法存储在寄存器中的类型。 非address-only（纯地址）类型称为loadable（可加载）类型，这意味着它们可以被加载到寄存器中。
+
+将一个地址类型指向一个非address-only（纯地址）类型是合法的，但是对象类型包含address-only（纯地址）类型是不合法的。
+
+可以在[/lib/SIL/IR/TypeLowering.cpp](https://github.com/apple/swift/blob/master/lib/SIL/IR/TypeLowering.cpp)查看实现细节，主要方法是getLoweredType()，从正式类型返回SIL类型。
+
+
+### Builtin
+
+因为下面例子中出现Builtin，所以这里稍微解释一下，采取[Swift's mysterious Builtin module](http://ankit.im/swift/2016/01/12/swift-mysterious-builtin-module/)文中一段话：
+
+
+>在Swift中，Int实际上一个struct，而+是一个针对Int重载的全局方法（global function）。严格说来，Int和+不是Swift语言的一部分，它们是Swift标准库的一部分。既然不是原生态，是不是就意味着操作Int或+的时候会有额外的负担，导致Swift跑得慢？当然不是，因为我们有Builtin。
+
+>Builtin将LLVM IR的类型和方法直接暴露给Swift标准库，所以我们在操作Int和+的时候，没有额外的运行时负担。
+
+>以Int为例，Int在标准库中是一个struct，定义了一个属性value，类型是Builtin.Int64。我们可以用unsafeBitCast将value属性在Int和Builtin.Int64之间相互转换。Int还重载了init方法，使得我们可以从Builtin.Int64直接构造一个Int。这些都是高效的操作，不会导致性能损失。
+
+
+### raw SIL 与 canonical SIL
+
+![](/assets/img/2020/SIL/developing-siloptimizer-pass.png)
+
+
+SIL有两种形式，raw SIL（原始SIL） 和 canonical SIL（规范SIL），刚刚从SILGen中出来的未经优化的SIL称为raw SIL。
+
+可以通过`swiftc`的`-emit-silgen`将Swift源码转变为raw SIL。
+
+```
+swiftc -emit-silgen Source.swift -o Source.sil
+```
+
+经过SIL Optimizer优化之后产生的优化SIL，称为规范SIL。可以通过`swiftc`的`-emit-sil`将raw SIL转变为canonical SIL。
+
+```
+swiftc Source.sil -emit-sil  > Source-canonical.sil
+```
+也可以直接将Swift源码转变为canonical SIL。
+
+```
+swiftc Source.swift -emit-sil  > Source-canonical.sil
+```
+
+
+### 例子讲解
+
+来看一个最简单的例子
+
+```
+func test(number: Int) -> Bool {
+    if number > 0 {
+        return true
+    } else {
+        return false
+    }
+}
+
+```
+
+使用一下swiftc命令转换成原始SIL，代码如下：
+
+```
+swiftc -emit-silgen Source.swift -o Source.sil
+
+```
+
+```
+sil_stage raw
+
+import Builtin
+import Swift
+import SwiftShims
+
+func test(number: Int) -> Bool
+
+// main
+sil [ossa] @main : $@convention(c) (Int32, UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>) -> Int32 {
+bb0(%0 : $Int32, %1 : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>):
+  %2 = integer_literal $Builtin.Int32, 0          // user: %3
+  %3 = struct $Int32 (%2 : $Builtin.Int32)        // user: %4
+  return %3 : $Int32                              // id: %4
+} // end sil function 'main'
+
+// test(number:)
+sil hidden [ossa] @$s6Source4test6numberSbSi_tF : $@convention(thin) (Int) -> Bool {
+// %0                                             // users: %8, %1
+bb0(%0 : $Int):
+  debug_value %0 : $Int, let, name "number", argno 1 // id: %1
+  %2 = metatype $@thin Int.Type                   // user: %8
+  %3 = integer_literal $Builtin.IntLiteral, 0     // user: %6
+  %4 = metatype $@thin Int.Type                   // user: %6
+  // function_ref Int.init(_builtinIntegerLiteral:)
+  %5 = function_ref @$sSi22_builtinIntegerLiteralSiBI_tcfC : $@convention(method) (Builtin.IntLiteral, @thin Int.Type) -> Int // user: %6
+  %6 = apply %5(%3, %4) : $@convention(method) (Builtin.IntLiteral, @thin Int.Type) -> Int // user: %8
+  // function_ref static Int.> infix(_:_:)
+  %7 = function_ref @$sSi1goiySbSi_SitFZ : $@convention(method) (Int, Int, @thin Int.Type) -> Bool // user: %8
+  %8 = apply %7(%0, %6, %2) : $@convention(method) (Int, Int, @thin Int.Type) -> Bool // user: %9
+  %9 = struct_extract %8 : $Bool, #Bool._value    // user: %10
+  cond_br %9, bb1, bb2                            // id: %10
+
+bb1:                                              // Preds: bb0
+  %11 = integer_literal $Builtin.Int1, -1         // user: %14
+  %12 = metatype $@thin Bool.Type                 // user: %14
+  // function_ref Bool.init(_builtinBooleanLiteral:)
+  %13 = function_ref @$sSb22_builtinBooleanLiteralSbBi1__tcfC : $@convention(method) (Builtin.Int1, @thin Bool.Type) -> Bool // user: %14
+  %14 = apply %13(%11, %12) : $@convention(method) (Builtin.Int1, @thin Bool.Type) -> Bool // user: %15
+  br bb3(%14 : $Bool)                             // id: %15
+
+bb2:                                              // Preds: bb0
+  %16 = integer_literal $Builtin.Int1, 0          // user: %19
+  %17 = metatype $@thin Bool.Type                 // user: %19
+  // function_ref Bool.init(_builtinBooleanLiteral:)
+  %18 = function_ref @$sSb22_builtinBooleanLiteralSbBi1__tcfC : $@convention(method) (Builtin.Int1, @thin Bool.Type) -> Bool // user: %19
+  %19 = apply %18(%16, %17) : $@convention(method) (Builtin.Int1, @thin Bool.Type) -> Bool // user: %20
+  br bb3(%19 : $Bool)                             // id: %20
+
+// %21                                            // user: %22
+bb3(%21 : $Bool):                                 // Preds: bb2 bb1
+  return %21 : $Bool                              // id: %22
+} // end sil function '$s6Source4test6numberSbSi_tF'
+
+// Int.init(_builtinIntegerLiteral:)
+sil [transparent] [serialized] @$sSi22_builtinIntegerLiteralSiBI_tcfC : $@convention(method) (Builtin.IntLiteral, @thin Int.Type) -> Int
+
+// static Int.> infix(_:_:)
+sil [transparent] [serialized] @$sSi1goiySbSi_SitFZ : $@convention(method) (Int, Int, @thin Int.Type) -> Bool
+
+// Bool.init(_builtinBooleanLiteral:)
+sil [transparent] [serialized] @$sSb22_builtinBooleanLiteralSbBi1__tcfC : $@convention(method) (Builtin.Int1, @thin Bool.Type) -> Bool
+
+```
+
+
+第一个是main函数，这里就不讲了。从test(number:)看起
+
+```
+sil hidden [ossa] @$s6Source4test6numberSbSi_tF : $@convention(thin) (Int) -> Bool {
+   .....
+}
+```
+
+* 这是一个SILFunction，里面包含三个SILBasicBlock，分别是bb0、bb1、bb2和bb3。
+* 方法名s6Source4test6numberSbSi_tF，是test(number:)经过命令重整之后的。SIL中的标识符名称以@符号开头。
+* convention(thin) (Int) -> Bool，convention(thin) 表示是Swift的函数调用，参数为Int类型，返回值为Bool类型。
+
+```
+bb0(%0 : $Int):
+  debug_value %0 : $Int, let, name "number", argno 1 // id: %1
+  %2 = metatype $@thin Int.Type                   // user: %8
+  %3 = integer_literal $Builtin.IntLiteral, 0     // user: %6
+  %4 = metatype $@thin Int.Type                   // user: %6
+  // function_ref Int.init(_builtinIntegerLiteral:)
+  %5 = function_ref @$sSi22_builtinIntegerLiteralSiBI_tcfC : $@convention(method) (Builtin.IntLiteral, @thin Int.Type) -> Int // user: %6
+  %6 = apply %5(%3, %4) : $@convention(method) (Builtin.IntLiteral, @thin Int.Type) -> Int // user: %8
+  // function_ref static Int.> infix(_:_:)
+  %7 = function_ref @$sSi1goiySbSi_SitFZ : $@convention(method) (Int, Int, @thin Int.Type) -> Bool // user: %8
+  %8 = apply %7(%0, %6, %2) : $@convention(method) (Int, Int, @thin Int.Type) -> Bool // user: %9
+  %9 = struct_extract %8 : $Bool, #Bool._value    // user: %10
+  cond_br %9, bb1, bb2 
+```
+
+这个简单的方法被分成4个代码块，bb0对应的是执行number > 0语句，bb1是对应if代码块，bb2对应else的代码块，bb3是return Bool代码块，接收一个Bool类型返回一个Bool类型。我们这里只分析bb0，其他的就不分析了。
+
+* 这是一个SILBasicBlock。
+* bb0(%0 : $Int)：%符号表示一个寄存器，这里第一个参数是Int类型，存放在%0。
+*  debug_value %0 : $Int, let, name "number", argno 1 // id: %1：// id: %1是注释，说明分配的寄存器为%1。
+* %2 = metatype $@thin Int.Type                   // user: %8：创建一个Int类型的的元类型对象，@thin表示该元类型不需要存储，因为它是精确类型。使用者是%8。
+* %3 = integer_literal $Builtin.IntLiteral, 0     // user: %6：创建一个整数文字值，类型Builtin.IntLiteral，该类型必须为内置整数类型。文字值是使用Swift的整数文字语法指定的，值为0，使用者%8。
+* %4 = metatype $@thin Int.Type                   // user: %6，创建一个Int类型的的元类型对象，@thin表示该元类型不需要存储，因为它是精确类型。使用者是%6。
+*  %5 = function\_ref @$sSi22\_builtinIntegerLiteralSiBI_tcfC : $@convention(method) (Builtin.IntLiteral, @thin Int.Type) -> Int // user: %6：function\_ref是创建函数的引用，参数类型是Builtin.IntLiteral和 @thin Int.Type，返回值是Int，这个函数实际上是把整数文字值0转变成Int类型值0。
+* %6 = apply %5(%3, %4) : $@convention(method) (Builtin.IntLiteral, @thin Int.Type) -> Int // user: %8：apply 调用函数，函数是 %5，传入参数是寄存器%3, %4)，执行完返回结果存储在寄存器%8。
+* %7 = function\_ref @$sSi1goiySbSi_SitFZ : $@convention(method) (Int, Int, @thin Int.Type) -> Bool // user: %8：创建函数的引用，参数类型分别是Int, Int, @thin Int.Type，使用者是%8。
+*  %8 = apply %7(%0, %6, %2) : $@convention(method) (Int, Int, @thin Int.Type) -> Bool // user: %9：apply 调用函数为%7，传入参数是寄存器%0, %6, %2，执行完返回结果存储在寄存器%9 ；
+*  cond\_br %9, bb1, bb2：cond_br是SILBasicBlock终止指令[Terminators](https://github.com/apple/swift/blob/master/docs/SIL.rst#terminators)的一种，条件分支指令，如果%9是true，跳转到bb1，false跳转到bb2。其实就是if number > 0 的条件跳转。
+
+
+### SIL潜在用途
+
+* Swift热更新，Rollout就是通过在 SIL层给每个方法添加一个前缀来操作应用的
+
+```
+func add(a:Int, b:Int) -> Int {
+if Rollout_shouldPatch(ROLLOUT_a79ee6d5a41da8daaa2fef82124dcf74) {
+    let resultRollout : Int =
+    Rollout_invokeReturn(Rollout_tweakData!,
+        target:self,
+        arguments:[a,
+            b,
+            origClosure: { args in return self.add(a:args[0],b:args[1]);});
+    return resultRollout;
+```
+
+在上面的代码中，Rollout_invokeReturn 负责执行一个从 Rollout 云下载的 JavaScript 函数。如果需要，该函数可以回调初始的方法。
+
+* Mutation tests，突变测试，又叫做“变异分析”，通常是改变代码中某个地方，测试程序是否能走到错误的代码逻辑。其实这个通过编译后端LLVM的JIT也可以，只是难度很大。
+
+
+[Swift Intermediate Language (SIL)](https://github.com/apple/swift/blob/tensorflow/docs/SIL.rst#sil-in-the-swift-compiler)   
+[2015 LLVM Developers’ Meeting: Joseph Groff & Chris Lattner “Swift's High-Level IR: A Case Study..."](https://www.youtube.com/watch?v=Ntj8ab-5cvE)    
+[https://benng.me/2017/08/27/high-level-sil-optimization-in-the-swift-compiler/](https://benng.me/2017/08/27/high-level-sil-optimization-in-the-swift-compiler/)   
+[How to talk to your kids about SIL type use](https://medium.com/@slavapestov/how-to-talk-to-your-kids-about-sil-type-use-6b45f7595f43)   
+[Cocoaheads KRK #29 Swift Intermediate Language - Bartosz Polaczyk](https://www.youtube.com/watch?v=M0iyooYWiFQ)  
+[什么是SSA以及SSA的作用](https://studygolang.com/articles/9361)  
+[Swift's mysterious Builtin module](http://ankit.im/swift/2016/01/12/swift-mysterious-builtin-module/)    
+[The secret life of types in Swift](https://medium.com/@slavapestov/the-secret-life-of-types-in-swift-ff83c3c000a5)
