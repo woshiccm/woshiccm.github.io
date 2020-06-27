@@ -176,7 +176,6 @@ sitemap_exclude:  # Sitemap will exclude the following items.
   accurate:
     - /norobots/
     - /tabs/
-    - /categories/
     - /tags/
     - /posts/
     - 404.html
