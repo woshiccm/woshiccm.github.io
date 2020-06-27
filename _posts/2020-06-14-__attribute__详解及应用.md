@@ -2,7 +2,6 @@
 title: __attribute__详解及应用
 author: Roy
 date: 2020-06-14 00:34:00 +0800
-categories: [其他]
 tags: [iOS]
 toc: false
 ---

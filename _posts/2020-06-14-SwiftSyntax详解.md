@@ -2,7 +2,6 @@
 title: SwiftSyntax详解
 author: Roy
 date: 2020-06-14 00:34:00 +0800
-categories: [SwiftSyntax]
 tags: [Swift]
 pin: true
 ---
